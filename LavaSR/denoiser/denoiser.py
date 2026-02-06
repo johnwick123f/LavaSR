@@ -1,11 +1,35 @@
 ## Code for denoiser architecture is from FastEnhancer
 ## https://github.com/aask1357/fastenhancer/blob/main/wrappers/ns.py
 
+import os
+
+import math
+import time
+import re
+import importlib
+from typing import Optional, Dict, Any
+
+import torch
+from torch import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils import clip_grad_norm_, clip_grad_value_
+from torch.utils.data import DataLoader
+try:
+    from torch.amp import GradScaler
+except:
+    from torch.cuda.amp import GradScaler
+import torch.distributed as dist
+from tqdm import tqdm
+
+import warnings
+from typing import Optional, Dict
+from torch import Tensor
+import torch.nn.functional as F
+from librosa.filters import mel as librosa_mel_fn
 import math
 import typing as tp
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm as weight_norm_fn
@@ -16,6 +40,11 @@ import warnings
 from typing import Optional, Tuple, List
 
 from LavaSR.denoiser.stft import STFT, CompressedSTFT
+
+
+mel_basis: Dict[str, Tensor] = {}
+hann_window: Dict[str, Tensor]  = {}
+
 
 class StridedConv1d(nn.Conv1d):
     """Same as nn.Conv1d with stride > 1.
@@ -703,3 +732,159 @@ class Model(ONNXModel):
             * torch.view_as_complex(mask)       # [B, F, T]
         wav_hat = self.stft.inverse(spec_hat)   # [B, T_wav]
         return wav_hat, torch.view_as_real(spec_hat)
+
+def stft(y: Tensor, n_fft: int, hop_size: int, win_size: int, center: bool = False,
+         magnitude: bool = True, check_value: bool = False, normalized: bool = False) -> Tensor:
+    ''' y shape: [batch_size, wav_len] or [batch_size, 1, wav_len]
+    output shape: [batch_size, wav_len//hop_size, 2] (center == False, magnitude=False)
+    output shape: [batch_size, wav_len//hop_size+1, 2] (center == True, magnitude=False)
+    '''
+    if y.dim() == 3:  # [B, 1, T] -> [B, T]
+        y = y.squeeze(1)
+
+    if check_value:
+        if torch.min(y) < -1.:
+            print('min value is ', torch.min(y))
+        if torch.max(y) > 1.:
+            print('max value is ', torch.max(y))
+
+    global hann_window
+    dtype_device = str(y.dtype) + '_' + str(y.device)
+    wnsize_dtype_device = str(win_size) + '_' + dtype_device
+    if wnsize_dtype_device not in hann_window:
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
+            dtype=y.dtype, device=y.device)
+
+    if not center:
+        y = F.pad(
+            y.unsqueeze(0),
+            (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)),
+            mode='reflect'
+        )
+        y = y.squeeze(0)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size,
+            window=hann_window[wnsize_dtype_device], center=center, pad_mode='reflect',
+            normalized=normalized, onesided=True, return_complex=False)
+
+    if magnitude:
+        spec = torch.linalg.norm(spec, dim=-1)
+
+    return spec
+
+
+def spec_to_mel(spec: Tensor, n_fft: int, num_mels: int, sampling_rate: int,
+                fmin: float = 0.0, fmax: Optional[float] = None, clip_val: float = 1e-5,
+                log: bool = True, norm: str = 'slaney') -> Tensor:
+    global mel_basis
+    norm_dtype_device = str(norm) + '_' + str(spec.dtype) + '_' + str(spec.device)
+    nmel_nfft_fmax_norm_dtype_device = str(num_mels) + '_' + str(n_fft) + '_' + str(fmax) + '_' + norm_dtype_device
+    if nmel_nfft_fmax_norm_dtype_device not in mel_basis:
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax, norm=norm)
+        mel_basis[nmel_nfft_fmax_norm_dtype_device] = torch.from_numpy(mel).to(dtype=spec.dtype, device=spec.device)
+    spec = torch.matmul(mel_basis[nmel_nfft_fmax_norm_dtype_device], spec)
+    if log:
+        spec = torch.log(torch.clamp(spec, min=clip_val))
+    return spec
+
+def get_model(hps) -> torch.nn.Module:
+    model: str = hps.model
+    #print(f"models.{model}.model")
+    #module = importlib.import_module(f"models.{model}.model")
+    return Model(**hps.model_kwargs)
+
+
+class ModelWrapper:
+    def __init__(self, hps, train=False, rank=0, device='cpu'):
+        self.base_dir: str = hps.base_dir
+        self.rank: int = rank
+        self.model: torch.nn.Module = get_model(hps)
+        self.train_mode: bool = train
+        self.device = device
+        self.epoch: int = 0
+        self.keys = []
+        self.infer_keys = []
+        self.set_keys()
+
+        self.h = hps.data
+        self.hop_size = hps.model_kwargs.hop_size
+        self.sr = hps.data.sampling_rate
+
+        self._module = self.model
+
+        self.device = device
+        self.model.to(device)
+        self._module.flatten_parameters()
+
+    def set_keys(self):
+        '''set self.keys, self.infer_keys
+        self.keys: used for train_dataset & valid_dataset
+        self.infer_keys: used for infer_dataset'''
+        self.keys = ["clean", "noisy"]
+        self.infer_keys = self.keys
+
+    def to(self, device):
+        self.device = device
+        self.model.to(device)
+
+    def get_checkpoint(
+        self,
+        epoch: Optional[int]=None,
+        path: Optional[str]=None
+    ) -> Optional[Dict[str, Any]]:
+        if path is None:
+            if epoch is None:       # get lastest checkpoint
+                files = [int(f[:-4]) for f in os.listdir(self.base_dir) if re.match('[0-9]{5,}.pth', f)]
+                if not files:
+                    if self.rank == 0:
+                        print("No checkpoint exists.")
+                    return None
+                files.sort()
+                epoch = files[-1]
+            path = os.path.join(self.base_dir, f"{epoch:0>5d}.pth")
+        checkpoint = torch.load(path, map_location=self.device)
+        if self.rank == 0:
+            print(f"Loading checkpoint file '{path}'...")
+        return checkpoint
+
+    def load(self, epoch: Optional[int] = None, path: Optional[str] = None, strict: bool = True):
+        checkpoint = self.get_checkpoint(epoch, path)
+        if checkpoint is None:
+            return
+
+        self._module.load_state_dict(checkpoint['model'], strict=strict)
+        self.epoch = checkpoint['epoch']
+
+        if self.train_mode:
+            self.optim.load_state_dict(checkpoint['optim'])
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+            self.scaler.load_state_dict(checkpoint['scaler'])
+            if self.metrics is not None:
+                self.metrics.load_state_dict(checkpoint['metrics'])
+
+    def save(self, path: Optional[str] = None):
+        if path is None:
+            path = os.path.join(self.base_dir, f"{self.epoch:0>5d}.pth")
+        wrapper_dict = {
+            "model": self._module.state_dict(),
+            "optim": self.optim.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "epoch": self.epoch,
+        }
+        if self.metrics is not None:
+            wrapper_dict["metrics"] = self.metrics.state_dict()
+
+        torch.save(wrapper_dict, path)
+
+    def train(self):
+        self.model.train()
+
+    def eval(self):
+        self.model.eval()
+
+    def remove_weight_reparameterizations(self) -> None:
+        self._module.remove_weight_reparameterizations()
+        
