@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LavaSR"
-version = "0.0.4"
+version = "0.0.1"
 authors = [
   { name="Yatharth Sharma", email="yatharthsharma3501@gmail.com" },
 ]
