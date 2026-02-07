@@ -48,6 +48,8 @@ class LavaBWE:
             features_input = self.bwe_model.feature_extractor(wav)
             features = self.bwe_model.backbone(features_input)
             pred_audio = self.bwe_model.head(features)
+            pred_audio = self.lr_refiner(pred_audio[:, :wav.shape[1]], wav[:, :pred_audio.shape[1]])
+
         return pred_audio
 
 
